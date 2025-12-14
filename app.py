@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+Improved Logs Search Bot
+- prettier UI (reply keyboard + inline)
+- typing/progress UX
+- announcement confirmation
+- prettier messages & pagination with page count
+- cooldown applies only after a successful search (default 60s)
+"""
+
 import os
 import random
 import time
@@ -11,9 +20,13 @@ from urllib.parse import quote_plus, unquote_plus
 from io import BytesIO
 
 import psycopg2
-from psycopg2 import OperationalError, sql
+from psycopg2 import OperationalError
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from telebot.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InputFile
+)
 from flask import Flask, request
 
 # -------------------------
@@ -25,11 +38,9 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "7011151235"))
 
 LOG_FILE = os.environ.get("LOG_FILE", "logs.txt")
 MAX_LINES = int(os.environ.get("MAX_LINES", 200))
-SEARCH_PREVIEW_PAGE = int(os.environ.get("SEARCH_PREVIEW_PAGE", 10))  # lines per page in preview
+SEARCH_PREVIEW_PAGE = int(os.environ.get("SEARCH_PREVIEW_PAGE", 10))  # lines per preview page
 
-# **COOLDOWN: default 60 seconds (1 minute)**
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", 60))
-
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", 60))  # 1 minute default
 BROADCAST_DELAY = float(os.environ.get("BROADCAST_DELAY", 0.05))
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -56,7 +67,6 @@ _stop_event = Event()
 def home():
     return "🤖 Logs Search Bot — alive"
 
-# allow admin to upload a log file via HTTP (optional)
 @app.route("/uploadlog", methods=["POST"])
 def http_upload_log():
     token = request.args.get("token")
@@ -66,7 +76,6 @@ def http_upload_log():
     if not f:
         return "No file", 400
     f.save(LOG_FILE)
-    # Invalidate in-memory logs (the bot checks file on next search)
     reload_logs()
     return "OK", 200
 
@@ -90,10 +99,10 @@ _curs = None
 def ensure_db():
     global _conn, _curs
     try:
-        if _conn is None or _conn.closed:
+        if _conn is None or getattr(_conn, "closed", False):
             _conn = new_conn()
             _curs = _conn.cursor()
-    except Exception as e:
+    except Exception:
         logger.exception("DB connect failed")
         raise
 
@@ -177,21 +186,70 @@ def reload_logs():
 reload_logs()
 
 # -------------------------
-# UTIL HELPERS
+# UTIL HELPERS / STYLING
 # -------------------------
-_user_cooldowns = {}  # user_id -> last_search_ts
+_user_cooldowns = {}  # user_id -> last_successful_search_ts (epoch seconds)
+_pending_announcements = {}  # admin_id -> (text, message_id_of_preview)
+
+def header_text():
+    return "✨ *Logs Search Bot* ✨\n\n"
+
+def pretty_time(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "N/A"
+
+def mk_reply_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(
+        KeyboardButton("🔍 Search Logs"),
+        KeyboardButton("📊 My Stats"),
+        KeyboardButton("⏳ My Access"),
+        KeyboardButton("♻️ Reset Search"),
+        KeyboardButton("ℹ️ About")
+    )
+    return kb
+
+def mk_inline_menu():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔍 Search Logs", callback_data="search"),
+        InlineKeyboardButton("📊 My Stats", callback_data="stats"),
+        InlineKeyboardButton("⏳ My Access", callback_data="access"),
+        InlineKeyboardButton("♻️ Reset Search", callback_data="reset"),
+        InlineKeyboardButton("📂 Download Logs", callback_data="download_logs"),
+        InlineKeyboardButton("📞 Owner", url="https://t.me/OnlyJosh4")
+    )
+    return kb
+
+def send_typing(chat_id, seconds=0.6):
+    # quick typing indicator
+    try:
+        bot.send_chat_action(chat_id, "typing")
+        if seconds > 0:
+            time.sleep(seconds)
+    except Exception:
+        pass
+
+def safe_send(user_id, text, **kwargs):
+    try:
+        bot.send_message(user_id, text, **kwargs)
+        return True, None
+    except Exception as e:
+        logger.exception("safe_send failed to %s", user_id)
+        return False, str(e)
+
+def format_dt(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "N/A"
 
 def check_cooldown(user_id):
     """
-    Returns (True, 0) if allowed, or (False, remaining_seconds) if still cooling down.
+    Returns (True, 0) if allowed now, or (False, remaining_seconds) if still cooling down.
+    Does NOT update timestamp here (timestamp is set only after a successful search with results).
     """
     now = time.time()
     last = _user_cooldowns.get(user_id, 0)
     remaining = COOLDOWN_SECONDS - (now - last)
     if remaining > 0:
-        # round up to nearest second
         return False, int(math.ceil(remaining))
-    _user_cooldowns[user_id] = now
     return True, 0
 
 def user_has_access(user_id):
@@ -210,49 +268,29 @@ def get_user_expiry(user_id):
     row = db_fetchone("SELECT expires FROM users WHERE user_id=%s", (user_id,))
     return row[0] if row else None
 
-def mk_menu():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🔍 Search Logs", callback_data="search"),
-        InlineKeyboardButton("📊 My Stats", callback_data="stats"),
-        InlineKeyboardButton("⏳ My Access", callback_data="access"),
-        InlineKeyboardButton("♻️ Reset Search", callback_data="reset"),
-        InlineKeyboardButton("📂 Download Logs", callback_data="download_logs"),
-        InlineKeyboardButton("📞 Owner", url="https://t.me/OnlyJosh4")
-    )
-    return kb
-
-def safe_send(user_id, text, **kwargs):
-    try:
-        bot.send_message(user_id, text, **kwargs)
-        return True, None
-    except Exception as e:
-        logger.exception("safe_send failed to %s", user_id)
-        return False, str(e)
-
-def format_dt(dt):
-    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "N/A"
-
 # -------------------------
-# COMMANDS
+# COMMANDS (improved messaging)
 # -------------------------
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     uid = message.from_user.id
     if not user_has_access(uid):
-        bot.send_message(message.chat.id, "❌ Access required.\nUse /redeem <key>")
+        bot.send_message(message.chat.id, header_text() + "❌ *Access required*\nUse `/redeem <key>`", parse_mode="Markdown")
         return
-    bot.send_message(message.chat.id, "✅ Welcome back! Choose an option:", reply_markup=mk_menu())
+    text = header_text() + "Welcome back! Choose an option below — you can also use the keyboard."
+    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=mk_inline_menu())
+    # also send reply keyboard for mobile convenience
+    bot.send_message(message.chat.id, "Quick menu:", reply_markup=mk_reply_keyboard())
 
 @bot.message_handler(commands=["about"])
 def cmd_about(message):
     about = (
-        "🤖 *Logs Search Bot*\n"
-        "Purpose: search large log files and return results safely.\n\n"
+        header_text() +
+        "A polished log-search tool with friendly UI.\n\n"
         f"• Max search lines: *{MAX_LINES}*\n"
-        f"• Per-search cooldown: *{COOLDOWN_SECONDS} seconds*\n"
-        "• No duplicate lines per user\n"
-        "• Admin features: create keys, announcement, upload logs\n\n"
+        f"• Per-search cooldown: *{COOLDOWN_SECONDS} seconds* (applies only after a successful search that returned results)\n"
+        "• Keys are single-use\n"
+        "• No duplicate lines per user\n\n"
         "Owner: @OnlyJosh4"
     )
     bot.send_message(message.chat.id, about, parse_mode="Markdown")
@@ -305,13 +343,14 @@ def cmd_redeem(message):
     txt = (
         "✅ *Key Successfully Redeemed*\n\n"
         f"*Expiration:* `{format_dt(expires_at)}`\n\n"
-        "Use the buttons below to start searching or view your stats."
+        "Tap *Start Searching* to run your first search, or *View Stats* to see saved results."
     )
     try:
         bot.send_message(uid, txt, reply_markup=kb, parse_mode="Markdown")
     except Exception:
         bot.send_message(uid, "✅ Key successfully redeemed!\nExpiration: " + format_dt(expires_at), reply_markup=kb)
 
+# Announcement flow: now with confirmation step
 @bot.message_handler(commands=["announcement"])
 def cmd_announcement(message):
     if message.from_user.id != ADMIN_ID:
@@ -322,14 +361,46 @@ def cmd_announcement(message):
         bot.reply_to(message, "Usage: /announcement <message>")
         return
     ann_text = parts[1].strip()
+
+    # send preview to admin with Confirm / Cancel buttons
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Confirm & Send", callback_data="ann_confirm"),
+        InlineKeyboardButton("❌ Cancel", callback_data="ann_cancel")
+    )
+    preview = "📣 *Announcement Preview*\n\n" + ann_text
+    sent = bot.send_message(message.chat.id, preview, parse_mode="Markdown", reply_markup=kb)
+    _pending_announcements[message.from_user.id] = (ann_text, sent.message_id)
+
+# Admin confirms/cancels announcement
+@bot.callback_query_handler(func=lambda c: c.data in ("ann_confirm", "ann_cancel"))
+def cb_announcement_confirm(call):
+    admin_id = call.from_user.id
+    if admin_id not in _pending_announcements:
+        bot.answer_callback_query(call.id, "No pending announcement.")
+        return
+
+    ann_text, preview_msg_id = _pending_announcements.pop(admin_id)
+    if call.data == "ann_cancel":
+        # edit preview to show cancelled
+        try:
+            bot.edit_message_text("❌ Announcement cancelled.", call.message.chat.id, preview_msg_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Cancelled.")
+        return
+
+    # proceed with sending
+    bot.answer_callback_query(call.id, "Sending announcement...")
     ensure_db()
     _curs.execute("SELECT user_id FROM users WHERE expires >= NOW()")
     rows = _curs.fetchall()
     user_ids = [r[0] for r in rows]
     if not user_ids:
-        bot.reply_to(message, "⚠️ No active users.")
+        bot.send_message(admin_id, "⚠️ No active users to send announcement to.")
         return
 
+    # buttons in announcement
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("🔍 Start Searching", callback_data="search"),
@@ -339,6 +410,7 @@ def cmd_announcement(message):
     sent = 0
     failed = 0
     fails = []
+    msg_status = bot.send_message(admin_id, f"📣 Sending to {len(user_ids)} users... (this may take a moment)")
     for uid in user_ids:
         ok, err = safe_send(uid, f"📣 Announcement:\n\n{ann_text}", reply_markup=kb)
         if ok:
@@ -349,14 +421,20 @@ def cmd_announcement(message):
                 fails.append((uid, err))
         time.sleep(BROADCAST_DELAY)
 
-    summary = f"📣 Sent: {sent}\n❌ Failed: {failed}"
-    if fails:
-        summary += "\nExamples:\n" + "\n".join(f"{u}: {e[:80]}" for u, e in fails)
-    bot.reply_to(message, summary)
+    # edit preview message to show summary
+    try:
+        summary = f"📣 Announcement sent.\n✅ Success: {sent}\n❌ Failed: {failed}"
+        if fails:
+            summary += "\n\nExamples:\n" + "\n".join(f"{u}: {e[:80]}" for u, e in fails)
+        bot.edit_message_text(summary, admin_id, preview_msg_id)
+    except Exception:
+        bot.send_message(admin_id, summary)
 
+# -------------------------
+# ADMIN HELPERS
+# -------------------------
 @bot.message_handler(commands=["users"])
 def cmd_users(message):
-    """Admin: get CSV of active users (user_id,expires)"""
     if message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "❌ Admin only")
         return
@@ -376,15 +454,14 @@ def cmd_users(message):
 
 @bot.message_handler(commands=["uploadlog"])
 def cmd_uploadlog(message):
-    """Admin: send a document with caption /uploadlog_file to replace LOG_FILE"""
     if message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "❌ Admin only")
         return
-    bot.send_message(message.chat.id, "Send the log file as a document with caption /uploadlog_file (admin only).")
+    bot.send_message(message.chat.id, "Send the log file as a document with caption `/uploadlog_file` (admin only).", parse_mode="Markdown")
 
 @bot.message_handler(content_types=["document"])
 def handle_document(message):
-    """Handle admin document uploads. To upload logs, admin must use caption /uploadlog_file"""
+    # admin uploads logs with caption "/uploadlog_file"
     if message.caption and message.caption.strip().lower() == "/uploadlog_file" and message.from_user.id == ADMIN_ID:
         doc = message.document
         file_info = bot.get_file(doc.file_id)
@@ -397,15 +474,15 @@ def handle_document(message):
         except Exception:
             logger.exception("Failed to write uploaded log file")
             bot.reply_to(message, "❌ Failed to save uploaded file.")
-    # else: ignore other documents
+    # ignore other documents
 
 # -------------------------
-# CALLBACKS (menu & pagination)
+# CALLBACKS (menu & pagination - prettier)
 # -------------------------
 @bot.callback_query_handler(func=lambda c: c.data == "search")
 def cb_search(call):
     if not user_has_access(call.from_user.id):
-        bot.send_message(call.message.chat.id, "❌ You need an active key. Use /redeem <key>")
+        bot.send_message(call.message.chat.id, "❌ You need an active key. Use `/redeem <key>`", parse_mode="Markdown")
         return
     msg = bot.send_message(call.message.chat.id, "🔎 Send keyword:")
     bot.register_next_step_handler(msg, process_search)
@@ -423,6 +500,12 @@ def cb_page(call):
     uid = call.from_user.id
     ensure_db()
     _curs.execute("""
+        SELECT COUNT(*) FROM searches WHERE user_id=%s AND keyword=%s
+    """, (uid, keyword))
+    total_saved = _curs.fetchone()[0] or 0
+    total_pages = max(1, math.ceil(total_saved / SEARCH_PREVIEW_PAGE))
+
+    _curs.execute("""
         SELECT line FROM searches
         WHERE user_id=%s AND keyword=%s
         ORDER BY found_at ASC
@@ -435,24 +518,16 @@ def cb_page(call):
         return
 
     kb = InlineKeyboardMarkup()
-    prev_disabled = page <= 0
-    _curs.execute("""
-        SELECT 1 FROM searches WHERE user_id=%s AND keyword=%s
-        LIMIT 1 OFFSET %s
-    """, (uid, keyword, (page + 1) * SEARCH_PREVIEW_PAGE))
-    has_next = bool(_curs.fetchone())
-
     nav_buttons = []
-    if not prev_disabled:
+    if page > 0:
         nav_buttons.append(InlineKeyboardButton("⬅ Prev", callback_data=f"page:{quote_plus(keyword)}:{page-1}"))
-    if has_next:
+    if page < total_pages - 1:
         nav_buttons.append(InlineKeyboardButton("Next ➡", callback_data=f"page:{quote_plus(keyword)}:{page+1}"))
     if nav_buttons:
         kb.row(*nav_buttons)
+    kb.add(InlineKeyboardButton(f"📥 Download All", callback_data=f"download:{quote_plus(keyword)}"))
 
-    kb.add(InlineKeyboardButton("📥 Download All", callback_data=f"download:{quote_plus(keyword)}"))
-
-    preview_text = "🔎 Preview results (page {}):\n\n".format(page+1) + "\n".join(lines[:SEARCH_PREVIEW_PAGE])
+    preview_text = f"🔎 Preview results (Page {page+1} / {total_pages}):\n\n" + "\n".join(lines[:SEARCH_PREVIEW_PAGE])
     bot.send_message(call.message.chat.id, preview_text, reply_markup=kb)
     bot.answer_callback_query(call.id)
 
@@ -494,12 +569,14 @@ def cb_stats(call):
     expiry = get_user_expiry(uid)
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("🔍 Search Logs", callback_data="search"))
-    bot.send_message(call.message.chat.id, f"📊 Total saved unique lines: {total}\n⏳ Access until: {format_dt(expiry)}", reply_markup=kb)
+    bot.send_message(call.message.chat.id,
+                     header_text() + f"📊 *Your Stats*\n\n• Saved unique lines: *{total}*\n• Access until: `{format_dt(expiry)}`",
+                     parse_mode="Markdown", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data == "access")
 def cb_access(call):
     expiry = get_user_expiry(call.from_user.id)
-    bot.send_message(call.message.chat.id, f"⏳ Access until: {format_dt(expiry)}" if expiry else "❌ No active access")
+    bot.send_message(call.message.chat.id, header_text() + (f"⏳ Access until: `{format_dt(expiry)}`" if expiry else "❌ No active access"), parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda c: c.data == "reset")
 def cb_reset(call):
@@ -521,75 +598,91 @@ def cb_download_logs(call):
         bot.answer_callback_query(call.id, "Failed to send logs")
 
 # -------------------------
-# SEARCH CORE
+# SEARCH CORE (improved UX)
 # -------------------------
 def process_search(message):
     uid = message.from_user.id
 
-    # --- cooldown check (1 minute default) ---
+    # cooldown check (no timestamp update here)
     allowed, rem = check_cooldown(uid)
     if not allowed:
-        # format remaining nicely
         mins = rem // 60
         secs = rem % 60
-        if mins > 0:
-            rem_text = f"{mins}m {secs}s"
-        else:
-            rem_text = f"{secs}s"
-        bot.send_message(message.chat.id, f"⏳ Please wait {rem_text} before your next search.")
+        rem_text = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+        bot.send_message(message.chat.id, f"⏳ Please wait *{rem_text}* before your next search.", parse_mode="Markdown")
         return
 
     if not user_has_access(uid):
-        bot.send_message(message.chat.id, "❌ You need an active key. Use /redeem <key>")
+        bot.send_message(message.chat.id, header_text() + "❌ *You need an active key.*\nUse `/redeem <key>`", parse_mode="Markdown")
         return
 
-    keyword = (message.text or "").strip().lower()
+    keyword = (message.text or "").strip()
     if not keyword:
         bot.send_message(message.chat.id, "❌ Empty keyword")
         return
 
+    # show typing/progress indicator, send a temporary message we can edit
+    send_typing(message.chat.id, 0.4)
+    temp = bot.send_message(message.chat.id, f"🔎 Searching for *{keyword}*... (this may take a moment)", parse_mode="Markdown")
+
+    # actual search
     found = []
     ensure_db()
     for line in LOGS:
         if len(found) >= MAX_LINES:
             break
-        if keyword in line.lower():
-            _curs.execute("SELECT 1 FROM searches WHERE user_id=%s AND keyword=%s AND line=%s", (uid, keyword, line))
+        if keyword.lower() in line.lower():
+            _curs.execute("SELECT 1 FROM searches WHERE user_id=%s AND keyword=%s AND line=%s", (uid, keyword.lower(), line))
             if not _curs.fetchone():
                 found.append(line)
-                _curs.execute("INSERT INTO searches (user_id, keyword, line) VALUES (%s,%s,%s)", (uid, keyword, line))
+                _curs.execute("INSERT INTO searches (user_id, keyword, line) VALUES (%s,%s,%s)", (uid, keyword.lower(), line))
 
     if not found:
-        bot.send_message(message.chat.id, "❌ No new results found (or duplicates filtered).")
         db_commit()
+        try:
+            bot.edit_message_text("❌ No new results found (or duplicates filtered). Try another keyword.", message.chat.id, temp.message_id)
+        except Exception:
+            bot.send_message(message.chat.id, "❌ No new results found (or duplicates filtered). Try another keyword.")
         return
 
     db_commit()
+
+    # set cooldown only after successful search
+    _user_cooldowns[uid] = time.time()
+
+    # Prepare results file
     filename = f"results_{quote_plus(keyword)[:50]}.txt"
     bio = BytesIO("\n".join(found).encode("utf-8"))
     bio.seek(0)
 
-    bot.send_document(message.chat.id, InputFile(bio, filename=filename),
-                      caption=f"✅ Found {len(found)} new lines (limited to {MAX_LINES})")
+    try:
+        bot.delete_message(message.chat.id, temp.message_id)
+    except Exception:
+        pass
 
+    # send document (full results)
+    bot.send_document(message.chat.id, InputFile(bio, filename=filename),
+                      caption=f"✅ Found *{len(found)}* new lines (limited to {MAX_LINES})", parse_mode="Markdown")
+
+    # create inline preview + nav
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📥 Download All", callback_data=f"download:{quote_plus(keyword)}"))
     if len(found) > SEARCH_PREVIEW_PAGE:
-        kb.row(InlineKeyboardButton("Preview Page 1", callback_data=f"page:{quote_plus(keyword)}:0"))
+        kb.add(InlineKeyboardButton("📄 Preview (page 1)", callback_data=f"page:{quote_plus(keyword)}:0"))
 
     first_lines = found[:SEARCH_PREVIEW_PAGE]
-    preview_text = "🔎 Preview (first {} lines):\n\n".format(min(len(first_lines), SEARCH_PREVIEW_PAGE)) + "\n".join(first_lines)
-    bot.send_message(message.chat.id, preview_text, reply_markup=kb)
+    preview_text = header_text() + f"🔎 Preview (first {len(first_lines)} lines):\n\n" + "\n".join(first_lines)
+    bot.send_message(message.chat.id, preview_text, parse_mode="Markdown", reply_markup=kb)
 
 # -------------------------
-# RUN (with robust polling restart)
+# RUN (robust polling)
 # -------------------------
 def run_polling():
     while not _stop_event.is_set():
         try:
             logger.info("Starting polling")
             bot.polling(none_stop=True, timeout=60)
-        except Exception as e:
+        except Exception:
             logger.exception("Polling crashed, restarting in 5s")
             time.sleep(5)
         else:
