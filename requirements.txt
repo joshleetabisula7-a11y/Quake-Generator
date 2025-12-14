@@ -1,3 +1,4 @@
+Flask
 pyTelegramBotAPI
 psycopg2-binary
-flask
+python-dateutil
