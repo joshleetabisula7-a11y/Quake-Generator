@@ -1,33 +1,19 @@
 #!/usr/bin/env python3
-"""
-Complete Logs Search Bot with Admin Panel (bot + web UI)
-- Bot features: keys, redeem, search, cooldown after successful search, pagination, admin notifications.
-- Admin bot commands: /delkey, /listkeys, /revoke, /grant, /delsearch, /exportsearches, /statsfull, /announcement, /users
-- Web admin panel: /admin?token=ADMIN_WEB_TOKEN (list/manage keys, users, searches, upload logs)
-- Requirements: pyTelegramBotAPI, psycopg2-binary, Flask
-"""
-
 import os
 import random
 import time
 import csv
-import math
 import logging
-import tempfile
-import html
 from datetime import datetime, timedelta
 from threading import Thread, Event
 from urllib.parse import quote_plus, unquote_plus
 from io import BytesIO
 
 import psycopg2
-from psycopg2 import OperationalError
+from psycopg2 import OperationalError, sql
 import telebot
-from telebot.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, InputFile
-)
-from flask import Flask, request, redirect, url_for, Response
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from flask import Flask, request
 
 # -------------------------
 # CONFIG
@@ -35,18 +21,16 @@ from flask import Flask, request, redirect, url_for, Response
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7011151235"))
-ADMIN_WEB_TOKEN = os.environ.get("ADMIN_WEB_TOKEN", "")  # new: protect web admin panel
-WEBHOOK_UPLOAD_TOKEN = os.environ.get("WEBHOOK_UPLOAD_TOKEN", "")
 
 LOG_FILE = os.environ.get("LOG_FILE", "logs.txt")
 MAX_LINES = int(os.environ.get("MAX_LINES", 200))
-SEARCH_PREVIEW_PAGE = int(os.environ.get("SEARCH_PREVIEW_PAGE", 10))
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", 60))  # default 60s
+SEARCH_PREVIEW_PAGE = int(os.environ.get("SEARCH_PREVIEW_PAGE", 10))  # lines per page in preview
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", 3))
 BROADCAST_DELAY = float(os.environ.get("BROADCAST_DELAY", 0.05))
 PORT = int(os.environ.get("PORT", 10000))
 
-if not TOKEN or not DATABASE_URL or not ADMIN_WEB_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN, DATABASE_URL, or ADMIN_WEB_TOKEN environment variables")
+if not TOKEN or not DATABASE_URL:
+    raise RuntimeError("Missing TELEGRAM_TOKEN or DATABASE_URL environment variables")
 
 # -------------------------
 # LOGGING
@@ -59,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("logs_bot")
 
 # -------------------------
-# KEEP ALIVE / WEB UI (RENDER)
+# KEEP ALIVE (RENDER)
 # -------------------------
 app = Flask(__name__)
 _stop_event = Event()
@@ -68,123 +52,19 @@ _stop_event = Event()
 def home():
     return "🤖 Logs Search Bot — alive"
 
-# Web admin panel (protected by ADMIN_WEB_TOKEN)
-def require_admin_token(req):
-    token = req.args.get("token", "")
-    return token == ADMIN_WEB_TOKEN
-
-@app.route("/admin", methods=["GET", "POST"])
-def web_admin():
-    if not require_admin_token(request):
-        return Response("Unauthorized - provide ?token=ADMIN_WEB_TOKEN", status=401)
-
-    # Handle POST actions: delete key, revoke user, grant access, delete search, upload logs
-    action = request.values.get("action", "")
-    message = ""
-    try:
-        ensure_db()
-        if action == "delkey":
-            key = request.values.get("key", "").strip()
-            if key:
-                _curs.execute("DELETE FROM keys WHERE key=%s", (key,))
-                db_commit()
-                message = f"Deleted key: {html.escape(key)}"
-        elif action == "revoke":
-            uid = int(request.values.get("user_id", "0"))
-            if uid:
-                _curs.execute("DELETE FROM users WHERE user_id=%s", (uid,))
-                db_commit()
-                message = f"Revoked user: {uid}"
-        elif action == "grant":
-            uid = int(request.values.get("user_id", "0"))
-            days = int(request.values.get("days", "0"))
-            if uid and days > 0:
-                expires = datetime.now() + timedelta(days=days)
-                _curs.execute("""
-                    INSERT INTO users (user_id, expires) VALUES (%s,%s)
-                    ON CONFLICT (user_id) DO UPDATE SET expires=EXCLUDED.expires
-                """, (uid, expires))
-                db_commit()
-                message = f"Granted {days} days to {uid} (until {expires.isoformat()})"
-        elif action == "delsearch":
-            uid = int(request.values.get("user_id", "0"))
-            kw = request.values.get("keyword", "").strip().lower()
-            if uid and kw:
-                _curs.execute("DELETE FROM searches WHERE user_id=%s AND keyword=%s", (uid, kw))
-                db_commit()
-                message = f"Deleted searches for user {uid} keyword {html.escape(kw)}"
-        elif action == "uploadlog":
-            token = request.values.get("token", "")
-            if token == WEBHOOK_UPLOAD_TOKEN:
-                f = request.files.get("file")
-                if f:
-                    f.save(LOG_FILE)
-                    reload_logs()
-                    message = "Uploaded logs and reloaded."
-            else:
-                message = "Invalid upload token"
-    except Exception as e:
-        logger.exception("Admin action failed")
-        message = f"Error: {e}"
-
-    # Build page: list keys, users, and a form for actions
-    ensure_db()
-    _curs.execute("SELECT key, expires, redeemed_by FROM keys ORDER BY expires DESC LIMIT 200")
-    keys = _curs.fetchall()
-    _curs.execute("SELECT user_id, expires FROM users ORDER BY expires DESC LIMIT 200")
-    users = _curs.fetchall()
-
-    # Simple HTML
-    html_out = "<html><head><title>Admin Panel</title></head><body style='font-family:Arial,sans-serif'>"
-    html_out += f"<h2>Admin Panel</h2><p style='color:green'>{html.escape(message)}</p>"
-    html_out += "<h3>Keys (latest 200)</h3><table border=1 cellpadding=4><tr><th>Key</th><th>Expires</th><th>Redeemed By</th><th>Action</th></tr>"
-    for k, ex, rb in keys:
-        html_out += "<tr>"
-        html_out += f"<td>{html.escape(k)}</td><td>{html.escape(str(ex))}</td><td>{html.escape(str(rb)) if rb else ''}</td>"
-        html_out += "<td>"
-        html_out += f"<form style='display:inline' method='post'><input type='hidden' name='action' value='delkey'><input type='hidden' name='key' value='{html.escape(k)}'><input type='hidden' name='token' value='{html.escape(request.args.get('token',''))}'><input type='submit' value='Delete'></form>"
-        html_out += "</td></tr>"
-    html_out += "</table>"
-
-    html_out += "<h3>Users (latest 200)</h3><table border=1 cellpadding=4><tr><th>User ID</th><th>Expires</th><th>Actions</th></tr>"
-    for uid, ex in users:
-        html_out += "<tr>"
-        html_out += f"<td>{html.escape(str(uid))}</td><td>{html.escape(str(ex))}</td>"
-        html_out += "<td>"
-        html_out += f"<form style='display:inline' method='post'><input type='hidden' name='action' value='revoke'><input type='hidden' name='user_id' value='{uid}'><input type='submit' value='Revoke'></form>"
-        html_out += f"&nbsp;<form style='display:inline' method='post'><input type='hidden' name='action' value='grant'><input type='hidden' name='user_id' value='{uid}'><input type='number' name='days' placeholder='days' min='1' style='width:80px'><input type='submit' value='Grant'></form>"
-        html_out += "</td></tr>"
-    html_out += "</table>"
-
-    # search deletion/export form
-    html_out += "<h3>Manage User Searches</h3>"
-    html_out += "<form method='post'>User ID: <input name='user_id' required> Keyword: <input name='keyword' required>"
-    html_out += "<input type='hidden' name='action' value='delsearch'><input type='submit' value='Delete Searches'></form>"
-
-    # upload log
-    html_out += "<h3>Upload Logs (requires WEBHOOK_UPLOAD_TOKEN)</h3>"
-    html_out += f"<form method='post' enctype='multipart/form-data'><input type='hidden' name='action' value='uploadlog'><input name='token' placeholder='upload token'> <input type='file' name='file'> <input type='submit' value='Upload'></form>"
-
-    html_out += "</body></html>"
-    return html_out
-
-# helper to serve exported searches as downloadable file
-@app.route("/export_search", methods=["GET"])
-def web_export_search():
-    if not require_admin_token(request):
-        return Response("Unauthorized - provide ?token=ADMIN_WEB_TOKEN", status=401)
-    user_id = int(request.args.get("user_id", "0"))
-    keyword = request.args.get("keyword", "").strip().lower()
-    if not user_id or not keyword:
-        return Response("Bad request", status=400)
-    ensure_db()
-    _curs.execute("SELECT line FROM searches WHERE user_id=%s AND keyword=%s ORDER BY found_at ASC LIMIT %s", (user_id, keyword, MAX_LINES))
-    rows = _curs.fetchall()
-    lines = [r[0] for r in rows]
-    if not lines:
-        return Response("No results", status=404)
-    output = "\n".join(lines)
-    return Response(output, mimetype="text/plain", headers={"Content-Disposition": f"attachment; filename=results_user{user_id}_{keyword[:30]}.txt"})
+# allow admin to upload a log file via HTTP (optional)
+@app.route("/uploadlog", methods=["POST"])
+def http_upload_log():
+    token = request.args.get("token")
+    if token != os.environ.get("WEBHOOK_UPLOAD_TOKEN", ""):
+        return "Unauthorized", 401
+    f = request.files.get("file")
+    if not f:
+        return "No file", 400
+    f.save(LOG_FILE)
+    # Invalidate in-memory logs (the bot checks file on next search)
+    reload_logs()
+    return "OK", 200
 
 def start_keep_alive():
     Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
@@ -195,7 +75,7 @@ def start_keep_alive():
 bot = telebot.TeleBot(TOKEN, threaded=True)
 
 # -------------------------
-# DATABASE (reconnect helper)
+# DATABASE (with reconnect helper)
 # -------------------------
 def new_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -206,14 +86,17 @@ _curs = None
 def ensure_db():
     global _conn, _curs
     try:
-        if _conn is None or getattr(_conn, "closed", False):
+        if _conn is None or _conn.closed:
             _conn = new_conn()
             _curs = _conn.cursor()
-    except Exception:
+    except Exception as e:
         logger.exception("DB connect failed")
         raise
 
 def db_execute(query, params=None, fetch=False):
+    """
+    Execute and optionally fetch, with reconnect logic.
+    """
     global _conn, _curs
     for attempt in range(2):
         try:
@@ -257,11 +140,13 @@ def init_db():
         expires TIMESTAMP,
         redeemed_by BIGINT
     )""")
+
     _curs.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
         expires TIMESTAMP
     )""")
+
     _curs.execute("""
     CREATE TABLE IF NOT EXISTS searches (
         user_id BIGINT,
@@ -273,9 +158,8 @@ def init_db():
     db_commit()
 
 # -------------------------
-# LOGS (reload before search)
+# LOGS (in-memory cache, reload function)
 # -------------------------
-LOGS = []
 def reload_logs():
     global LOGS
     LOGS = []
@@ -292,42 +176,16 @@ def reload_logs():
 reload_logs()
 
 # -------------------------
-# HELPERS & UI
+# UTIL HELPERS
 # -------------------------
-_user_cooldowns = {}  # user_id -> last_successful_search_ts
-
-def header_text():
-    return "✨ *Logs Search Bot* ✨\n\n"
-
-def mk_inline_menu():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🔍 Search Logs", callback_data="search"),
-        InlineKeyboardButton("📊 My Stats", callback_data="stats"),
-        InlineKeyboardButton("⏳ My Access", callback_data="access"),
-        InlineKeyboardButton("♻️ Reset Search", callback_data="reset"),
-        InlineKeyboardButton("📥 My Searches (Download)", callback_data="my_downloads"),
-        InlineKeyboardButton("📞 Owner", url="https://t.me/OnlyJosh4")
-    )
-    return kb
-
-def safe_send(user_id, text, **kwargs):
-    try:
-        bot.send_message(user_id, text, **kwargs)
-        return True, None
-    except Exception as e:
-        logger.exception("safe_send failed to %s", user_id)
-        return False, str(e)
-
-def format_dt(dt):
-    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "N/A"
+_user_cooldowns = {}  # user_id -> last_search_ts
 
 def check_cooldown(user_id):
     now = time.time()
     last = _user_cooldowns.get(user_id, 0)
-    remaining = COOLDOWN_SECONDS - (now - last)
-    if remaining > 0:
-        return False, int(math.ceil(remaining))
+    if now - last < COOLDOWN_SECONDS:
+        return False, COOLDOWN_SECONDS - (now - last)
+    _user_cooldowns[user_id] = now
     return True, 0
 
 def user_has_access(user_id):
@@ -346,176 +204,107 @@ def get_user_expiry(user_id):
     row = db_fetchone("SELECT expires FROM users WHERE user_id=%s", (user_id,))
     return row[0] if row else None
 
-def send_typing(chat_id, seconds=0.4):
+def mk_menu():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔍 Search Logs", callback_data="search"),
+        InlineKeyboardButton("📊 My Stats", callback_data="stats"),
+        InlineKeyboardButton("⏳ My Access", callback_data="access"),
+        InlineKeyboardButton("♻️ Reset Search", callback_data="reset"),
+        InlineKeyboardButton("📂 Download Logs", callback_data="download_logs"),
+        InlineKeyboardButton("📞 Owner", url="https://t.me/OnlyJosh4")
+    )
+    return kb
+
+def safe_send(user_id, text, **kwargs):
     try:
-        bot.send_chat_action(chat_id, "typing")
-        if seconds > 0:
-            time.sleep(seconds)
-    except:
-        pass
+        bot.send_message(user_id, text, **kwargs)
+        return True, None
+    except Exception as e:
+        logger.exception("safe_send failed to %s", user_id)
+        return False, str(e)
+
+def format_dt(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "N/A"
 
 # -------------------------
-# BOT COMMANDS (including admin commands)
+# COMMANDS
 # -------------------------
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     uid = message.from_user.id
     if not user_has_access(uid):
-        bot.send_message(message.chat.id, header_text() + "❌ *Access required*\nUse `/redeem <key>`", parse_mode="Markdown")
+        bot.send_message(message.chat.id, "❌ Access required.\nUse /redeem <key>")
         return
-    bot.send_message(message.chat.id, header_text() + "Welcome — choose an option:", parse_mode="Markdown", reply_markup=mk_inline_menu())
+    bot.send_message(message.chat.id, "✅ Welcome back! Choose an option:", reply_markup=mk_menu())
 
 @bot.message_handler(commands=["about"])
 def cmd_about(message):
     about = (
-        header_text() +
-        "A polished log-search tool.\n\n"
+        "🤖 *Logs Search Bot*\n"
+        "Purpose: search large log files and return results safely.\n\n"
         f"• Max search lines: *{MAX_LINES}*\n"
-        f"• Per-search cooldown: *{COOLDOWN_SECONDS}s* (only after successful search)\n"
+        "• No duplicate lines per user\n"
+        "• Admin features: create keys, announcement, upload logs\n\n"
         "Owner: @OnlyJosh4"
     )
     bot.send_message(message.chat.id, about, parse_mode="Markdown")
 
-# Admin: list keys (unused and all)
-@bot.message_handler(commands=["listkeys"])
-def cmd_listkeys(message):
+@bot.message_handler(commands=["createkey"])
+def cmd_createkey(message):
     if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "❌ Not authorized")
-        return
-    ensure_db()
-    _curs.execute("SELECT key, expires, redeemed_by FROM keys ORDER BY expires DESC LIMIT 200")
-    rows = _curs.fetchall()
-    if not rows:
-        bot.reply_to(message, "No keys.")
-        return
-    lines = []
-    for k, ex, rb in rows:
-        lines.append(f"{k} | expires: {format_dt(ex)} | redeemed_by: {rb or '-'}")
-    msg = "Keys:\n" + "\n".join(lines)
-    bot.reply_to(message, msg)
-
-@bot.message_handler(commands=["delkey"])
-def cmd_delkey(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "❌ Not authorized")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "Usage: /delkey KEY-XXXXXX")
-        return
-    key = parts[1].strip()
-    ensure_db()
-    _curs.execute("DELETE FROM keys WHERE key=%s RETURNING key", (key,))
-    res = _curs.fetchone()
-    db_commit()
-    if res:
-        bot.reply_to(message, f"✅ Deleted key {key}")
-    else:
-        bot.reply_to(message, "Key not found")
-
-@bot.message_handler(commands=["revoke"])
-def cmd_revoke(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "❌ Not authorized")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "Usage: /revoke <user_id>")
+        bot.reply_to(message, "❌ Admin only")
         return
     try:
-        uid = int(parts[1].strip())
-    except:
-        bot.reply_to(message, "Invalid user id")
-        return
-    ensure_db()
-    _curs.execute("DELETE FROM users WHERE user_id=%s RETURNING user_id", (uid,))
-    res = _curs.fetchone()
-    db_commit()
-    if res:
-        bot.reply_to(message, f"✅ Revoked access for {uid}")
-    else:
-        bot.reply_to(message, "User not found or no active access")
-
-@bot.message_handler(commands=["grant"])
-def cmd_grant(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "❌ Not authorized")
-        return
-    parts = message.text.split()
-    if len(parts) < 3:
-        bot.reply_to(message, "Usage: /grant <user_id> <days>")
-        return
-    try:
-        uid = int(parts[1]); days = int(parts[2])
-    except:
-        bot.reply_to(message, "Invalid parameters")
+        _, days, count = message.text.split()
+        days, count = int(days), int(count)
+    except Exception:
+        bot.reply_to(message, "Usage: /createkey <days> <count>")
         return
     expires = datetime.now() + timedelta(days=days)
-    ensure_db()
-    _curs.execute("""
+    keys = []
+    for _ in range(count):
+        k = f"KEY-{random.randint(100000, 999999)}"
+        db_execute("INSERT INTO keys (key, expires, redeemed_by) VALUES (%s,%s,NULL)", (k, expires))
+        keys.append(k)
+    db_commit()
+    bot.reply_to(message, "✅ Keys created:\n" + "\n".join(keys))
+
+@bot.message_handler(commands=["redeem"])
+def cmd_redeem(message):
+    try:
+        _, key = message.text.split(maxsplit=1)
+    except Exception:
+        bot.reply_to(message, "Usage: /redeem KEY-XXXXXX")
+        return
+    uid = message.from_user.id
+    row = db_fetchone("SELECT expires FROM keys WHERE key=%s AND redeemed_by IS NULL", (key,))
+    if not row:
+        bot.reply_to(message, "❌ Invalid or already-used key")
+        return
+    expires_at = row[0]
+    db_execute("""
         INSERT INTO users (user_id, expires) VALUES (%s,%s)
         ON CONFLICT (user_id) DO UPDATE SET expires=EXCLUDED.expires
-    """, (uid, expires))
+    """, (uid, expires_at))
+    db_execute("UPDATE keys SET redeemed_by=%s WHERE key=%s", (uid, key))
     db_commit()
-    bot.reply_to(message, f"✅ Granted access to {uid} until {format_dt(expires)}")
 
-@bot.message_handler(commands=["delsearch"])
-def cmd_delsearch(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "❌ Not authorized")
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        bot.reply_to(message, "Usage: /delsearch <user_id> <keyword>")
-        return
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔍 Start Searching", callback_data="search"),
+        InlineKeyboardButton("📊 View Stats", callback_data="stats")
+    )
+    txt = (
+        "✅ *Key Successfully Redeemed*\n\n"
+        f"*Expiration:* `{format_dt(expires_at)}`\n\n"
+        "Use the buttons below to start searching or view your stats."
+    )
     try:
-        uid = int(parts[1]); kw = parts[2].strip().lower()
-    except:
-        bot.reply_to(message, "Invalid parameters")
-        return
-    ensure_db()
-    _curs.execute("DELETE FROM searches WHERE user_id=%s AND keyword=%s", (uid, kw))
-    deleted = _curs.rowcount
-    db_commit()
-    bot.reply_to(message, f"✅ Deleted {deleted} saved search lines for user {uid} keyword {kw}")
+        bot.send_message(uid, txt, reply_markup=kb, parse_mode="Markdown")
+    except Exception:
+        bot.send_message(uid, "✅ Key successfully redeemed!\nExpiration: " + format_dt(expires_at), reply_markup=kb)
 
-@bot.message_handler(commands=["exportsearches"])
-def cmd_exportsearches(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "❌ Not authorized")
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        bot.reply_to(message, "Usage: /exportsearches <user_id> <keyword>")
-        return
-    try:
-        uid = int(parts[1]); kw = parts[2].strip().lower()
-    except:
-        bot.reply_to(message, "Invalid parameters")
-        return
-    ensure_db()
-    _curs.execute("SELECT line FROM searches WHERE user_id=%s AND keyword=%s ORDER BY found_at ASC LIMIT %s", (uid, kw, MAX_LINES))
-    rows = _curs.fetchall()
-    lines = [r[0] for r in rows]
-    if not lines:
-        bot.reply_to(message, "No saved results")
-        return
-    bio = BytesIO("\n".join(lines).encode("utf-8"))
-    bio.seek(0)
-    bot.send_document(message.chat.id, InputFile(bio, filename=f"results_user{uid}_{kw[:30]}.txt"), caption=f"Export: {len(lines)} lines")
-
-@bot.message_handler(commands=["statsfull"])
-def cmd_statsfull(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "❌ Not authorized")
-        return
-    ensure_db()
-    _curs.execute("SELECT COUNT(*) FROM keys"); keys = _curs.fetchone()[0]
-    _curs.execute("SELECT COUNT(*) FROM users"); users = _curs.fetchone()[0]
-    _curs.execute("SELECT COUNT(*) FROM searches"); searches = _curs.fetchone()[0]
-    bot.reply_to(message, f"DB Stats:\nKeys: {keys}\nUsers: {users}\nSearch lines saved: {searches}")
-
-# Keep previous admin commands: /announcement, /users etc (from earlier)
 @bot.message_handler(commands=["announcement"])
 def cmd_announcement(message):
     if message.from_user.id != ADMIN_ID:
@@ -526,6 +315,8 @@ def cmd_announcement(message):
         bot.reply_to(message, "Usage: /announcement <message>")
         return
     ann_text = parts[1].strip()
+    rows = db_fetchone("SELECT user_id FROM users WHERE expires >= NOW()")
+    # fetchall style
     ensure_db()
     _curs.execute("SELECT user_id FROM users WHERE expires >= NOW()")
     rows = _curs.fetchall()
@@ -533,23 +324,34 @@ def cmd_announcement(message):
     if not user_ids:
         bot.reply_to(message, "⚠️ No active users.")
         return
-    sent = 0; failed = 0; fails = []
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🔍 Search Logs", callback_data="search"))
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔍 Start Searching", callback_data="search"),
+        InlineKeyboardButton("📊 View Stats", callback_data="stats")
+    )
+
+    sent = 0
+    failed = 0
+    fails = []
     for uid in user_ids:
         ok, err = safe_send(uid, f"📣 Announcement:\n\n{ann_text}", reply_markup=kb)
-        if ok: sent += 1
+        if ok:
+            sent += 1
         else:
             failed += 1
-            if len(fails) < 5: fails.append((uid, err))
+            if len(fails) < 5:
+                fails.append((uid, err))
         time.sleep(BROADCAST_DELAY)
-    summary = f"📣 Sent: {sent}  Failed: {failed}"
+
+    summary = f"📣 Sent: {sent}\n❌ Failed: {failed}"
     if fails:
         summary += "\nExamples:\n" + "\n".join(f"{u}: {e[:80]}" for u, e in fails)
     bot.reply_to(message, summary)
 
 @bot.message_handler(commands=["users"])
 def cmd_users(message):
+    """Admin: get CSV of active users (user_id,expires)"""
     if message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "❌ Admin only")
         return
@@ -567,166 +369,240 @@ def cmd_users(message):
     output.seek(0)
     bot.send_document(message.chat.id, InputFile(output, filename="users.csv"))
 
+@bot.message_handler(commands=["uploadlog"])
+def cmd_uploadlog(message):
+    """Admin: send a document with caption /uploadlog to replace LOG_FILE"""
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "❌ Admin only")
+        return
+    # Expect the admin to send the file as a document; we reply asking for a file
+    bot.send_message(message.chat.id, "Send the log file as a document with caption /uploadlog_file (or use the UI Upload).")
+
+@bot.message_handler(content_types=["document"])
+def handle_document(message):
+    """Handle admin document uploads. To upload logs, admin must use caption /uploadlog_file"""
+    if message.caption and message.caption.strip().lower() == "/uploadlog_file" and message.from_user.id == ADMIN_ID:
+        doc = message.document
+        file_info = bot.get_file(doc.file_id)
+        file_bytes = bot.download_file(file_info.file_path)
+        try:
+            with open(LOG_FILE, "wb") as fh:
+                fh.write(file_bytes)
+            reload_logs()
+            bot.reply_to(message, "✅ Log file replaced and reloaded.")
+        except Exception:
+            logger.exception("Failed to write uploaded log file")
+            bot.reply_to(message, "❌ Failed to save uploaded file.")
+    # else: ignore other documents
+
 # -------------------------
-# CALLBACKS (search triggers)
+# CALLBACKS (menu & pagination)
 # -------------------------
 @bot.callback_query_handler(func=lambda c: c.data == "search")
 def cb_search(call):
     if not user_has_access(call.from_user.id):
-        bot.send_message(call.message.chat.id, "❌ You need an active key. Use `/redeem <key>`", parse_mode="Markdown")
+        bot.send_message(call.message.chat.id, "❌ You need an active key. Use /redeem <key>")
         return
     msg = bot.send_message(call.message.chat.id, "🔎 Send keyword:")
     bot.register_next_step_handler(msg, process_search)
 
-@bot.callback_query_handler(func=lambda c: c.data == "my_downloads")
-def cb_my_downloads(call):
-    # sends list of saved keywords for user with links to download (bot sends file)
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("page:"))
+def cb_page(call):
+    """
+    callback_data format: page:<quoted_keyword>:<page_index>
+    page_index is 0-based
+    """
+    try:
+        _, qkw, page_str = call.data.split(":", 2)
+        keyword = unquote_plus(qkw)
+        page = int(page_str)
+    except Exception:
+        bot.answer_callback_query(call.id, "Invalid page data")
+        return
+
+    # fetch preview lines from DB for this user & keyword
     uid = call.from_user.id
     ensure_db()
-    _curs.execute("SELECT DISTINCT keyword, COUNT(*) FROM searches WHERE user_id=%s GROUP BY keyword ORDER BY COUNT DESC", (uid,))
+    _curs.execute("""
+        SELECT line FROM searches
+        WHERE user_id=%s AND keyword=%s
+        ORDER BY found_at ASC
+        LIMIT %s OFFSET %s
+    """, (uid, keyword, SEARCH_PREVIEW_PAGE, page * SEARCH_PREVIEW_PAGE))
     rows = _curs.fetchall()
-    if not rows:
-        bot.answer_callback_query(call.id, "No saved searches")
+    lines = [r[0] for r in rows]
+    if not lines:
+        bot.answer_callback_query(call.id, "No more lines.")
         return
-    msg = "Your saved searches:\n"
-    for kw, cnt in rows:
-        msg += f"- {kw} ({cnt} lines)\n"
-    bot.send_message(call.message.chat.id, msg)
 
-# -------------------------
-# SEARCH CORE (reliable send + admin notify)
-# -------------------------
-def get_user_display(user):
-    uname = getattr(user, "username", None)
-    if uname:
-        return f"@{uname}"
-    name = (user.first_name or "") + (" " + (user.last_name or "") if user.last_name else "")
-    return name.strip() or str(user.id)
+    kb = InlineKeyboardMarkup()
+    # Prev / Next
+    prev_disabled = page <= 0
+    # To check if next exists, try to fetch one row beyond
+    _curs.execute("""
+        SELECT 1 FROM searches WHERE user_id=%s AND keyword=%s
+        LIMIT 1 OFFSET %s
+    """, (uid, keyword, (page + 1) * SEARCH_PREVIEW_PAGE))
+    has_next = bool(_curs.fetchone())
 
-def notify_admin_of_search(user, keyword, found_lines, duration_seconds, file_path):
+    nav_buttons = []
+    if not prev_disabled:
+        nav_buttons.append(InlineKeyboardButton("⬅ Prev", callback_data=f"page:{quote_plus(keyword)}:{page-1}"))
+    if has_next:
+        nav_buttons.append(InlineKeyboardButton("Next ➡", callback_data=f"page:{quote_plus(keyword)}:{page+1}"))
+    if nav_buttons:
+        kb.row(*nav_buttons)
+
+    # Download all button
+    kb.add(InlineKeyboardButton("📥 Download All", callback_data=f"download:{quote_plus(keyword)}"))
+
+    preview_text = "🔎 Preview results (page {}):\n\n".format(page+1) + "\n".join(lines[:SEARCH_PREVIEW_PAGE])
+    bot.send_message(call.message.chat.id, preview_text, reply_markup=kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("download:"))
+def cb_download(call):
+    # download:<keyword>
     try:
-        examples = "\n".join(found_lines[:5])
-        msg = (
-            "🔔 *User Search Generated*\n\n"
-            f"*User:* {get_user_display(user)} (`{user.id}`)\n"
-            f"*Keywords:* `{keyword}`\n"
-            f"*Lines Found:* {len(found_lines)}\n\n"
-            f"*Example lines:*\n{examples}\n\n"
-            f"*Time Searched:* `{format_dt(datetime.now())}`\n"
-            f"*Search Duration:* `{duration_seconds:.3f}s`"
-        )
-        bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
-        if file_path and os.path.exists(file_path):
-            with open(file_path, "rb") as fh:
-                bot.send_document(ADMIN_ID, fh, caption=f"Full results for {get_user_display(user)} — keyword: {keyword}")
-    except Exception:
-        logger.exception("notify_admin_of_search failed")
+        _, qkw = call.data.split(":", 1)
+        keyword = unquote_plus(qkw)
+    except:
+        bot.answer_callback_query(call.id, "Invalid download request")
+        return
 
+    uid = call.from_user.id
+    # gather all lines for this user+keyword (up to MAX_LINES)
+    ensure_db()
+    _curs.execute("""
+        SELECT line FROM searches
+        WHERE user_id=%s AND keyword=%s
+        ORDER BY found_at ASC
+        LIMIT %s
+    """, (uid, keyword, MAX_LINES))
+    rows = _curs.fetchall()
+    lines = [r[0] for r in rows]
+    if not lines:
+        bot.answer_callback_query(call.id, "No results saved for this keyword")
+        return
+
+    bio = BytesIO("\n".join(lines).encode("utf-8"))
+    bio.seek(0)
+    fname = f"results_{keyword[:30]}.txt"
+    bot.send_document(call.message.chat.id, InputFile(bio, filename=fname), caption=f"✅ {len(lines)} lines (saved results)")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data == "stats")
+def cb_stats(call):
+    uid = call.from_user.id
+    ensure_db()
+    _curs.execute("SELECT COUNT(*) FROM searches WHERE user_id=%s", (uid,))
+    total = _curs.fetchone()[0]
+    expiry = get_user_expiry(uid)
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔍 Search Logs", callback_data="search"))
+    bot.send_message(call.message.chat.id, f"📊 Total saved unique lines: {total}\n⏳ Access until: {format_dt(expiry)}", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data == "access")
+def cb_access(call):
+    expiry = get_user_expiry(call.from_user.id)
+    bot.send_message(call.message.chat.id, f"⏳ Access until: {format_dt(expiry)}" if expiry else "❌ No active access")
+
+@bot.callback_query_handler(func=lambda c: c.data == "reset")
+def cb_reset(call):
+    ensure_db()
+    _curs.execute("DELETE FROM searches WHERE user_id=%s", (call.from_user.id,))
+    db_commit()
+    bot.send_message(call.message.chat.id, "♻️ Your search memory has been cleared")
+
+@bot.callback_query_handler(func=lambda c: c.data == "download_logs")
+def cb_download_logs(call):
+    """Admin-only: allow users to download raw log file only if admin or owner."""
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Only owner can download raw logs.")
+        return
+    try:
+        with open(LOG_FILE, "rb") as fh:
+            bot.send_document(call.message.chat.id, fh, caption="Raw logs file")
+    except Exception:
+        logger.exception("Failed sending raw logs")
+        bot.answer_callback_query(call.id, "Failed to send logs")
+
+# -------------------------
+# SEARCH CORE
+# -------------------------
 def process_search(message):
     uid = message.from_user.id
-
-    allowed, rem = check_cooldown(uid)
-    if not allowed:
-        mins = rem // 60; secs = rem % 60
-        rem_text = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
-        bot.send_message(message.chat.id, f"⏳ Please wait *{rem_text}* before your next search.", parse_mode="Markdown")
+    ok, wait = check_cooldown(uid)
+    if not ok:
+        bot.send_message(message.chat.id, f"⏳ Please wait {int(wait)+1}s before next search.")
         return
 
     if not user_has_access(uid):
-        bot.send_message(message.chat.id, header_text() + "❌ *You need an active key.*\nUse `/redeem <key>`", parse_mode="Markdown")
+        bot.send_message(message.chat.id, "❌ You need an active key. Use /redeem <key>")
         return
 
-    reload_logs()
-
-    keyword_raw = (message.text or "").strip()
-    if not keyword_raw:
+    keyword = (message.text or "").strip().lower()
+    if not keyword:
         bot.send_message(message.chat.id, "❌ Empty keyword")
         return
-    keyword = keyword_raw.lower()
-
-    send_typing(message.chat.id, 0.3)
-    start_ts = time.time()
-    temp_msg = bot.send_message(message.chat.id, f"🔎 Searching for *{keyword_raw}*...", parse_mode="Markdown")
 
     found = []
+    count_searched = 0
     ensure_db()
     for line in LOGS:
         if len(found) >= MAX_LINES:
             break
+        count_searched += 1
         if keyword in line.lower():
+            # check if this user already saved this line for this keyword
             _curs.execute("SELECT 1 FROM searches WHERE user_id=%s AND keyword=%s AND line=%s", (uid, keyword, line))
             if not _curs.fetchone():
                 found.append(line)
                 _curs.execute("INSERT INTO searches (user_id, keyword, line) VALUES (%s,%s,%s)", (uid, keyword, line))
 
-    db_commit()
-    duration = time.time() - start_ts
-
     if not found:
-        try:
-            bot.edit_message_text("❌ No new results found (or duplicates filtered). Try another keyword.", message.chat.id, temp_msg.message_id)
-        except Exception:
-            bot.send_message(message.chat.id, "❌ No new results found (or duplicates filtered). Try another keyword.")
+        bot.send_message(message.chat.id, "❌ No new results found (or duplicates filtered).")
+        db_commit()
         return
 
-    _user_cooldowns[uid] = time.time()
+    db_commit()
+    # write full results file to send as document
+    filename = f"results_{quote_plus(keyword)[:50]}.txt"
+    bio = BytesIO("\n".join(found).encode("utf-8"))
+    bio.seek(0)
 
-    # create temp results file
-    try:
-        fd, tmp_path = tempfile.mkstemp(prefix="results_", suffix=".txt")
-        os.close(fd)
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(found))
-    except Exception:
-        logger.exception("Failed creating temp results file")
-        tmp_path = None
+    # send document
+    bot.send_document(message.chat.id, InputFile(bio, filename=filename),
+                      caption=f"✅ Found {len(found)} new lines (limited to {MAX_LINES})")
 
-    try:
-        if tmp_path and os.path.exists(tmp_path):
-            with open(tmp_path, "rb") as fh:
-                bot.send_document(message.chat.id, fh, caption=f"✅ Found {len(found)} lines (limited to {MAX_LINES})")
-        else:
-            bio = BytesIO("\n".join(found).encode("utf-8"))
-            bio.seek(0)
-            bot.send_document(message.chat.id, bio, caption=f"✅ Found {len(found)} lines (limited to {MAX_LINES})")
-    except Exception:
-        logger.exception("Failed sending results to user")
-        bot.send_message(message.chat.id, "❌ Failed to send results. Try again later.")
-        if tmp_path and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except: pass
-        return
-
+    # send preview with pagination buttons
     kb = InlineKeyboardMarkup()
+    # attach page 0
     kb.add(InlineKeyboardButton("📥 Download All", callback_data=f"download:{quote_plus(keyword)}"))
-    if len(found) > SEARCH_PREVIEW_PAGE:
-        kb.add(InlineKeyboardButton("📄 Preview (page 1)", callback_data=f"page:{quote_plus(keyword)}:0"))
+    # only add page nav if there is more than one preview page
+    total_saved = len(found)
+    if total_saved > SEARCH_PREVIEW_PAGE:
+        kb.row(
+            InlineKeyboardButton("Preview Page 1", callback_data=f"page:{quote_plus(keyword)}:0")
+        )
+    else:
+        # small preview inside message (no nav)
+        pass
 
-    preview_lines = found[:SEARCH_PREVIEW_PAGE]
-    preview_text = header_text() + f"🔎 Preview (first {len(preview_lines)} lines):\n\n" + "\n".join(preview_lines[:SEARCH_PREVIEW_PAGE])
-    bot.send_message(message.chat.id, preview_text, parse_mode="Markdown", reply_markup=kb)
-
-    # notify admin
-    try:
-        notify_admin_of_search(message.from_user, keyword_raw, found, duration, tmp_path if tmp_path else "")
-    except Exception:
-        logger.exception("Failed to notify admin")
-
-    if tmp_path and os.path.exists(tmp_path):
-        try:
-            os.remove(tmp_path)
-        except:
-            pass
+    # show first page inline (or first SEARCH_PREVIEW_PAGE lines)
+    first_lines = found[:SEARCH_PREVIEW_PAGE]
+    preview_text = "🔎 Preview (first {} lines):\n\n".format(min(len(first_lines), SEARCH_PREVIEW_PAGE)) + "\n".join(first_lines)
+    bot.send_message(message.chat.id, preview_text, reply_markup=kb)
 
 # -------------------------
-# RUN
+# RUN (with robust polling restart)
 # -------------------------
 def run_polling():
     while not _stop_event.is_set():
         try:
             logger.info("Starting polling")
             bot.polling(none_stop=True, timeout=60)
-        except Exception:
+        except Exception as e:
             logger.exception("Polling crashed, restarting in 5s")
             time.sleep(5)
         else:
