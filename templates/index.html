@@ -3,136 +3,226 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Admin Panel</title>
+  <title>Cool Admin Panel</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body { padding-top: 22px; }
+    body { padding: 18px; background:#f8f9fa; }
+    code.key { background:#eef; padding:4px 6px; border-radius:6px; display:inline-block;}
     .small-muted { color:#6c757d; font-size:0.9rem; }
-    table td, table th { vertical-align: middle; }
+    .card { box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+    pre.log { max-height:320px; overflow:auto; white-space:pre-wrap; background:#111; color:#eee; padding:12px; border-radius:6px;}
   </style>
 </head>
-<body class="bg-light">
+<body>
   <div class="container">
     <div class="d-flex justify-content-between align-items-center mb-3">
-      <h2>Bot Admin Panel</h2>
-      <div>
-        <a href="{{ url_for('admin_export_csv', q=q) }}" class="btn btn-outline-secondary btn-sm">Export CSV</a>
-        <a href="{{ url_for('logout') }}" class="btn btn-outline-danger btn-sm">Logout</a>
-      </div>
+      <h3>🚀 Cool Admin Panel</h3>
+      <div class="small-muted">Public if no admin key set. Secure it in production.</div>
     </div>
 
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% for cat, msg in messages %}
-        <div class="alert alert-{{ 'danger' if cat=='danger' else 'success' }}">{{ msg }}</div>
-      {% endfor %}
-    {% endwith %}
-
-    <div class="card mb-3">
-      <div class="card-body">
-        <div class="row">
-          <div class="col-md-9">
-            <strong>Uptime:</strong> {{ status.uptime }} <br>
-            <span class="small-muted">Total users: {{ status.total_users }} &nbsp;&middot;&nbsp; Active: {{ status.active_users }} &nbsp;&middot;&nbsp;
-              Online (5m): {% if status.online_users is none %}<em>not tracked</em>{% else %}{{ status.online_users }}{% endif %}
-            </span>
-          </div>
-          <div class="col-md-3 text-end small-muted">
-            Total keys: {{ total }}
-          </div>
-        </div>
-      </div>
+    <!-- Top stats -->
+    <div class="row g-3 mb-3">
+      <div class="col-md-3"><div class="card p-3"><div>Uptime</div><h5 id="uptime">–</h5></div></div>
+      <div class="col-md-3"><div class="card p-3"><div>Total users</div><h5 id="total_users">–</h5></div></div>
+      <div class="col-md-3"><div class="card p-3"><div>Active users</div><h5 id="active_users">–</h5></div></div>
+      <div class="col-md-3"><div class="card p-3"><div>Online (5m)</div><h5 id="online_users">–</h5></div></div>
     </div>
 
-    <div class="card mb-3">
-      <div class="card-body">
-        <form class="row g-2" method="get" action="{{ url_for('admin_index') }}">
-          <input type="hidden" name="page" value="1">
-          <div class="col-md-4">
-            <input class="form-control" name="q" placeholder="Search key or redeemer id" value="{{ q }}">
+    <div class="row">
+      <div class="col-lg-7">
+        <div class="card mb-3 p-3">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h5 class="mb-0">Keys</h5>
+            <div>
+              <button id="exportKeys" class="btn btn-sm btn-outline-secondary">Export CSV</button>
+            </div>
           </div>
-          <div class="col-auto">
-            <button class="btn btn-primary">Search</button>
-            <a href="{{ url_for('admin_index') }}" class="btn btn-outline-secondary">Clear</a>
-          </div>
-          <div class="col text-end">
-            <form method="post" action="{{ url_for('admin_generate') }}" style="display:inline-block;">
-              <input type="hidden" name="days" value="30">
-              <input type="hidden" name="count" value="1">
+
+          <form id="keysSearchForm" class="row g-2 mb-2">
+            <div class="col-auto">
+              <input id="keysQ" class="form-control form-control-sm" placeholder="Search key or redeemer">
+            </div>
+            <div class="col-auto">
+              <button class="btn btn-sm btn-primary" type="submit">Search</button>
+            </div>
+            <div class="col text-end small-muted">Page <span id="keysPage">1</span></div>
+          </form>
+
+          <div class="mb-2">
+            <form id="genForm" class="row g-2 align-items-center">
+              <div class="col-auto"><input name="days" class="form-control form-control-sm" type="number" min="1" value="30"></div>
+              <div class="col-auto"><input name="count" class="form-control form-control-sm" type="number" min="1" value="1"></div>
+              <div class="col-auto"><button class="btn btn-success btn-sm">Generate</button></div>
+              <div class="col small-muted">Tip: keep count reasonable</div>
             </form>
           </div>
-        </form>
 
-        <hr>
+          <div class="table-responsive">
+            <table id="keysTable" class="table table-sm">
+              <thead>
+                <tr><th>Key</th><th>Expires</th><th>Redeemed</th><th>Status</th><th>Action</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
 
-        <form class="row g-2 align-items-center mb-3" method="post" action="{{ url_for('admin_generate') }}">
-          <div class="col-auto">
-            <label class="visually-hidden">Days</label>
-            <input name="days" class="form-control" type="number" value="30" min="1" required>
-          </div>
-          <div class="col-auto">
-            <label class="visually-hidden">Count</label>
-            <input name="count" class="form-control" type="number" value="1" min="1" required>
-          </div>
-          <div class="col-auto">
-            <button class="btn btn-success">Generate</button>
-          </div>
-          <div class="col text-muted small">
-            Tip: limit count to avoid accidental massive inserts.
-          </div>
-        </form>
-
-        <div class="table-responsive">
-          <table class="table table-sm table-hover">
-            <thead>
-              <tr>
-                <th>Key</th>
-                <th>Expires (UTC)</th>
-                <th>Redeemed by</th>
-                <th>Status</th>
-                <th style="width:120px">Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for k in keys %}
-                <tr>
-                  <td><code>{{ k.key }}</code></td>
-                  <td>{{ k.expires or '-' }}</td>
-                  <td>{{ k.redeemed_by or '-' }}</td>
-                  <td>{% if k.active %}<span class="badge bg-success">Active</span>{% else %}<span class="badge bg-secondary">Inactive</span>{% endif %}</td>
-                  <td>
-                    <form method="post" action="{{ url_for('admin_delete') }}" style="display:inline;">
-                      <input type="hidden" name="key_to_delete" value="{{ k.key }}">
-                      <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Delete {{ k.key }}?')">Delete</button>
-                    </form>
-                  </td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+          <nav><ul id="keysPager" class="pagination pagination-sm"></ul></nav>
         </div>
 
-        <!-- pagination -->
-        <nav aria-label="pagination">
-          <ul class="pagination">
-            {% if page > 1 %}
-              <li class="page-item"><a class="page-link" href="{{ url_for('admin_index', q=q, page=page-1, per_page=per_page) }}">Prev</a></li>
-            {% else %}
-              <li class="page-item disabled"><span class="page-link">Prev</span></li>
-            {% endif %}
-            <li class="page-item disabled"><span class="page-link">Page {{ page }} / {{ pages }}</span></li>
-            {% if page < pages %}
-              <li class="page-item"><a class="page-link" href="{{ url_for('admin_index', q=q, page=page+1, per_page=per_page) }}">Next</a></li>
-            {% else %}
-              <li class="page-item disabled"><span class="page-link">Next</span></li>
-            {% endif %}
-          </ul>
-        </nav>
+        <div class="card mb-3 p-3">
+          <div class="d-flex justify-content-between">
+            <h5 class="mb-0">Users</h5>
+            <div>
+              <button id="exportUsers" class="btn btn-sm btn-outline-secondary">Export CSV</button>
+            </div>
+          </div>
 
+          <form id="usersSearchForm" class="row g-2 my-2">
+            <div class="col-auto"><input id="usersQ" class="form-control form-control-sm" placeholder="Search user id"></div>
+            <div class="col-auto"><button class="btn btn-sm btn-primary">Search</button></div>
+          </form>
+
+          <div class="table-responsive">
+            <table id="usersTable" class="table table-sm">
+              <thead><tr><th>User ID</th><th>Expires</th><th>Last Active</th><th>Action</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="col-lg-5">
+        <div class="card mb-3 p-3">
+          <h5 class="mb-2">Logs (tail)</h5>
+          <div class="d-flex mb-2">
+            <input id="logsN" type="number" class="form-control form-control-sm me-2" value="200" style="width:110px">
+            <button id="refreshLogs" class="btn btn-sm btn-outline-primary">Refresh</button>
+            <a id="downloadLogs" class="btn btn-sm btn-outline-secondary ms-2" href="/api/logs/download">Download</a>
+          </div>
+          <pre id="logsPre" class="log">Loading...</pre>
+        </div>
+
+        <div class="card p-3">
+          <h5 class="mb-2">Quick Status Chart</h5>
+          <canvas id="statusChart" height="180"></canvas>
+        </div>
       </div>
     </div>
 
-    <p class="text-muted small">Protect this panel — use a secure ADMIN_PASSWORD and keep your server behind a firewall or VPN.</p>
   </div>
+
+<script>
+const state = { keysPage:1, keysPer:50, keysQ:'' , usersPage:1, usersPer:50, usersQ:'' };
+
+async function api(path, opts){ 
+  const res = await fetch(path, opts); 
+  if(!res.ok){ const t = await res.text(); throw new Error(t||res.statusText); } 
+  return res.json(); 
+}
+
+function renderKeysTable(keys){
+  const tbody = document.querySelector('#keysTable tbody'); tbody.innerHTML='';
+  for(const k of keys){
+    const tr = document.createElement('tr');
+    tr.innerHTML = ` <td><code class="key">${k.key}</code></td>
+      <td>${k.expires||'-'}</td>
+      <td>${k.redeemed_by||'-'}</td>
+      <td>${k.active?'<span class="badge bg-success">Active</span>':'<span class="badge bg-secondary">Inactive</span>'}</td>
+      <td>
+        <button class="btn btn-sm btn-danger btn-del" data-key="${k.key}">Delete</button>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+  document.querySelectorAll('.btn-del').forEach(b=>{
+    b.onclick = async ()=> {
+      if(!confirm('Delete '+b.dataset.key+'?')) return;
+      await fetch('/api/keys/delete', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'key='+encodeURIComponent(b.dataset.key)});
+      loadKeys();
+    }
+  });
+}
+
+async function loadKeys(){
+  const res = await api(`/api/keys?q=${encodeURIComponent(state.keysQ||'')}&page=${state.keysPage}&per_page=${state.keysPer}`);
+  renderKeysTable(res.keys);
+  document.getElementById('keysPage').textContent = res.page + ' / ' + Math.max(1, Math.ceil(res.total/state.keysPer));
+  const pager = document.getElementById('keysPager'); pager.innerHTML='';
+  const prev = document.createElement('li'); prev.className = 'page-item ' + (res.page<=1? 'disabled':''); prev.innerHTML = `<a class="page-link" href="#">Prev</a>`; pager.appendChild(prev);
+  prev.onclick = e => { e.preventDefault(); if(res.page>1){ state.keysPage--; loadKeys(); } };
+  const next = document.createElement('li'); next.className = 'page-item'; next.innerHTML = `<a class="page-link" href="#">Next</a>`; pager.appendChild(next);
+  next.onclick = e => { e.preventDefault(); state.keysPage++; loadKeys(); };
+}
+
+async function loadUsers(){
+  const res = await api(`/api/users?q=${encodeURIComponent(state.usersQ||'')}&page=${state.usersPage}&per_page=${state.usersPer}`);
+  const tbody = document.querySelector('#usersTable tbody'); tbody.innerHTML='';
+  for(const u of res.users){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${u.user_id}</td><td>${u.expires||'-'}</td><td>${u.last_active||'-'}</td>
+      <td>
+        <button class="btn btn-sm btn-warning btn-revoke" data-uid="${u.user_id}">Revoke</button>
+        <button class="btn btn-sm btn-outline-secondary btn-extend" data-uid="${u.user_id}">Extend</button>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+  document.querySelectorAll('.btn-revoke').forEach(b=>{
+    b.onclick = async ()=> {
+      if(!confirm('Revoke '+b.dataset.uid+'?')) return;
+      await fetch('/api/users/revoke',{method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'user_id='+encodeURIComponent(b.dataset.uid)});
+      loadUsers(); loadStats();
+    }
+  });
+  document.querySelectorAll('.btn-extend').forEach(b=>{
+    b.onclick = async ()=>{
+      const days = prompt('Extend days (e.g. 30):','30'); if(!days) return;
+      await fetch('/api/users/extend',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({user_id:b.dataset.uid, days:parseInt(days)})});
+      loadUsers(); loadStats();
+    }
+  });
+}
+
+async function loadLogs(){
+  const n = document.getElementById('logsN').value || 200;
+  const res = await api(`/api/logs/tail?n=${n}`);
+  document.getElementById('logsPre').textContent = res.lines.join('\\n');
+}
+
+async function loadStats(){
+  const s = await api('/api/stats');
+  document.getElementById('uptime').textContent = s.uptime;
+  document.getElementById('total_users').textContent = s.total_users;
+  document.getElementById('active_users').textContent = s.active_users;
+  document.getElementById('online_users').textContent = s.online_users;
+  updateChart([s.total_users, s.active_users, s.online_users]);
+}
+
+function updateChart(vals){
+  if(!window.statusChart){
+    const ctx = document.getElementById('statusChart').getContext('2d');
+    window.statusChart = new Chart(ctx, {
+      type:'doughnut',
+      data:{labels:['Total','Active','Online'], datasets:[{data:vals}]},
+      options:{plugins:{legend:{position:'bottom'}}}
+    });
+  } else {
+    window.statusChart.data.datasets[0].data = vals;
+    window.statusChart.update();
+  }
+}
+
+document.getElementById('keysSearchForm').onsubmit = e=>{ e.preventDefault(); state.keysQ = document.getElementById('keysQ').value; state.keysPage=1; loadKeys(); };
+document.getElementById('usersSearchForm').onsubmit = e=>{ e.preventDefault(); state.usersQ = document.getElementById('usersQ').value; loadUsers(); };
+document.getElementById('genForm').onsubmit = async (e)=>{ e.preventDefault(); const fd = new FormData(e.target); const days = fd.get('days'); const count = fd.get('count'); await fetch('/api/keys/generate',{method:'POST', body: new URLSearchParams({days,count})}); loadKeys(); loadStats(); };
+document.getElementById('refreshLogs').onclick = ()=> loadLogs();
+document.getElementById('exportKeys').onclick = ()=> { window.location = '/api/keys/export.csv?q='+encodeURIComponent(state.keysQ||''); };
+document.getElementById('exportUsers').onclick = ()=> { window.location = '/api/users/export.csv?q='+encodeURIComponent(state.usersQ||''); };
+
+loadStats(); loadKeys(); loadUsers(); loadLogs();
+setInterval(()=>{ loadStats(); }, 15000);
+setInterval(()=>{ loadLogs(); }, 30000);
+</script>
 </body>
-  </html>
+                                                                   </html>
